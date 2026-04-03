@@ -54,6 +54,26 @@ def send_message(receive_id, text, access_token=None):
     res = requests.post(url, headers=get_headers(access_token), json=body, params=param).json()
     return res
 
+def add_reaction(message_id, emoji_type, access_token=None):
+    """给消息添加表情回应"""
+    if access_token is None:
+        access_token = get_tenant_access_token()
+
+    url = f'https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/reactions'
+    body = {"reaction_type": {"emoji_type": emoji_type}}
+    res = requests.post(url, headers=get_headers(access_token), json=body).json()
+    return res
+
+def remove_reaction(message_id, reaction_id, access_token=None):
+    """移除表情回应"""
+    if access_token is None:
+        access_token = get_tenant_access_token()
+
+    url = f'https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/reactions/{reaction_id}'
+    res = requests.delete(url, headers=get_headers(access_token)).json()
+    return res
+
+
 def get_department_member_list(department_id, access_token=None):
     if access_token is None:
         access_token = get_tenant_access_token()

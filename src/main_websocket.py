@@ -20,7 +20,7 @@ import lark_oapi as lark
 from lark_oapi.api.im.v1 import *
 
 from src.claude_code import chat_sync
-from src.feishu_utils.feishu_utils import send_message, reply_message
+from src.feishu_utils.feishu_utils import send_message, reply_message, add_reaction, remove_reaction
 from src.data_base_utils import get_session, save_session
 from src.security import is_user_allowed, PermissionManager
 
@@ -32,6 +32,10 @@ logger = logging.getLogger(__name__)
 
 # 全局 PermissionManager 实例
 permission_manager = PermissionManager(send_message)
+
+# 消息去重：防止同一条消息被处理两次
+_processed_msg_ids: set[str] = set()
+_msg_id_lock = threading.Lock()
 
 # 正在处理中的 chat_id 队列（只保留未完成的）
 _active_queues: dict[str, Queue] = {}
@@ -67,6 +71,7 @@ def _process_chat_queue(chat_id: str, message_id: str, chat_type: str, queue: Qu
     """
     处理指定 chat_id 的消息队列（FIFO）
     同一 chat_id 串行处理，不同 chat_id 可并行
+    队列中的每条消息格式: (text, reaction_id)
     """
     while True:
         # 在锁内检查并获取消息，确保线程安全
@@ -75,7 +80,7 @@ def _process_chat_queue(chat_id: str, message_id: str, chat_type: str, queue: Qu
                 # 队列空了，销毁并退出
                 _active_queues.pop(chat_id, None)
                 return
-            text = queue.get_nowait()
+            text, reaction_id = queue.get_nowait()
 
         try:
             reply = chat_with_claude(chat_id, text)
@@ -86,20 +91,27 @@ def _process_chat_queue(chat_id: str, message_id: str, chat_type: str, queue: Qu
             logger.info(f"回复: {reply[:100]}...")
         except Exception as e:
             logger.error(f"处理失败 [{chat_id[:8]}...]: {e}")
+        finally:
+            # 移除 OnIt
+            try:
+                if reaction_id:
+                    remove_reaction(message_id, reaction_id)
+            except Exception:
+                pass
 
 
-def enqueue_message(chat_id: str, message_id: str, text: str, chat_type: str):
+def enqueue_message(chat_id: str, message_id: str, text: str, chat_type: str, reaction_id: str = None):
     """
     将消息加入队列，无队列则创建
     """
     with _queue_lock:
         if chat_id in _active_queues:
             # 已有队列，直接加入
-            _active_queues[chat_id].put(text)
+            _active_queues[chat_id].put((text, reaction_id))
         else:
             # 创建新队列并启动 worker
             queue = Queue()
-            queue.put(text)
+            queue.put((text, reaction_id))
             _active_queues[chat_id] = queue
             threading.Thread(
                 target=_process_chat_queue,
@@ -115,6 +127,16 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
         message = event.message
         message_id = message.message_id
         sender_id = event.sender.sender_id.open_id
+
+        # ── 消息去重 ──
+        with _msg_id_lock:
+            if message_id in _processed_msg_ids:
+                logger.debug(f"重复消息，忽略: {message_id}")
+                return
+            _processed_msg_ids.add(message_id)
+            # 防止内存泄漏，保留最近 1000 条
+            if len(_processed_msg_ids) > 1000:
+                _processed_msg_ids.clear()
 
         # ── 白名单检查 ──
         if not is_user_allowed(sender_id):
@@ -143,8 +165,17 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
         chat_id = message.chat_id
         logger.info(f"收到消息: {message_id}: {text}")
 
+        # 👀 立刻标记正在处理
+        reaction_id = None
+        try:
+            res = add_reaction(message_id, "OnIt")
+            if isinstance(res, dict) and res.get("data"):
+                reaction_id = res["data"].get("reaction_id")
+        except Exception:
+            pass
+
         # 加入队列，按 chat_id 串行处理
-        enqueue_message(chat_id, message_id, text, message.chat_type)
+        enqueue_message(chat_id, message_id, text, message.chat_type, reaction_id)
 
     except Exception as e:
         logger.error(f"处理消息失败: {e}")
