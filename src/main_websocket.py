@@ -14,21 +14,24 @@ load_dotenv()  # 必须在导入其他模块之前加载
 import json
 import logging
 import threading
-from queue import Queue, Empty
+from queue import Queue
 
 import lark_oapi as lark
-from lark_oapi.adapter.flask import *
 from lark_oapi.api.im.v1 import *
 
 from src.claude_code import chat_sync
 from src.feishu_utils.feishu_utils import send_message, reply_message
 from src.data_base_utils import get_session, save_session
+from src.security import is_user_allowed, PermissionManager
 
 APP_ID = os.getenv("APP_ID")
 APP_SECRET = os.getenv("APP_SECRET")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# 全局 PermissionManager 实例
+permission_manager = PermissionManager(send_message)
 
 # 正在处理中的 chat_id 队列（只保留未完成的）
 _active_queues: dict[str, Queue] = {}
@@ -41,15 +44,22 @@ def chat_with_claude(chat_id: str, message: str) -> str:
     """
     # 从 SQLite 获取之前的 session_id
     session_id = get_session(chat_id)
-    
+
+    # 创建带授权回调的 canUseTool
+    can_use_tool = permission_manager.make_callback(chat_id)
+
     # 调用 Claude
-    reply, new_session_id = chat_sync(message, session_id=session_id)
-    
+    reply, new_session_id = chat_sync(
+        message,
+        session_id=session_id,
+        can_use_tool=can_use_tool,
+    )
+
     # 保存到 SQLite
     if new_session_id != session_id:
         save_session(chat_id, new_session_id)
         logger.info(f"会话映射: {chat_id[:8]}... -> {new_session_id[:8]}...")
-    
+
     return reply
 
 
@@ -66,7 +76,7 @@ def _process_chat_queue(chat_id: str, message_id: str, chat_type: str, queue: Qu
                 _active_queues.pop(chat_id, None)
                 return
             text = queue.get_nowait()
-        
+
         try:
             reply = chat_with_claude(chat_id, text)
             if chat_type == "group":
@@ -104,24 +114,38 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
         event = data.event
         message = event.message
         message_id = message.message_id
+        sender_id = event.sender.sender_id.open_id
+
+        # ── 白名单检查 ──
+        if not is_user_allowed(sender_id):
+            logger.debug(f"非白名单用户，忽略: {sender_id}")
+            return
+
         # 解析消息内容
         content = json.loads(message.content)
         text = content.get("text", "")
-        
+
         # 去掉 @机器人
         if message.mentions:
             for mention in message.mentions:
                 text = text.replace(f"@{mention.name}", "").strip()
-        
+
         if not text:
             return
-        
+
+        # ── 授权回复路由 ──
+        # 如果是回复消息且 parent_id 对应一个待处理的授权请求，走授权流程
+        parent_id = getattr(message, "parent_id", None) or ""
+        if parent_id and permission_manager.handle_approval_reply(parent_id, text):
+            logger.info(f"授权回复已处理: {message_id} -> parent={parent_id}")
+            return
+
         chat_id = message.chat_id
         logger.info(f"收到消息: {message_id}: {text}")
-        
+
         # 加入队列，按 chat_id 串行处理
         enqueue_message(chat_id, message_id, text, message.chat_type)
-        
+
     except Exception as e:
         logger.error(f"处理消息失败: {e}")
 
@@ -136,8 +160,8 @@ def main():
             .build(),
         log_level=lark.LogLevel.INFO,
     )
-    
-    logger.info("启动飞书长连接...")
+
+    logger.info("启动飞书长连接（已启用安全层）...")
     client.start()
 
 
