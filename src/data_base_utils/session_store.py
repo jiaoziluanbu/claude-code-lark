@@ -38,3 +38,11 @@ def save_session(chat_id: str, session_id: str):
     """, (chat_id, session_id))
     conn.commit()
     conn.close()
+
+
+def delete_session(chat_id: str):
+    """删除 session_id"""
+    conn = _get_conn()
+    conn.execute("DELETE FROM sessions WHERE chat_id = ?", (chat_id,))
+    conn.commit()
+    conn.close()

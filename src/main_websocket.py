@@ -21,7 +21,7 @@ from lark_oapi.api.im.v1 import *
 
 from src.claude_code import chat_sync
 from src.feishu_utils.feishu_utils import send_message, reply_message, add_reaction, remove_reaction
-from src.data_base_utils import get_session, save_session
+from src.data_base_utils import get_session, save_session, delete_session
 from src.security import is_user_allowed, PermissionManager
 
 APP_ID = os.getenv("APP_ID")
@@ -40,6 +40,59 @@ _msg_id_lock = threading.Lock()
 # 正在处理中的 chat_id 队列（只保留未完成的）
 _active_queues: dict[str, Queue] = {}
 _queue_lock = threading.Lock()
+
+
+# ── 斜杠命令 ──
+
+def _handle_command(chat_id: str, message_id: str, chat_type: str, command: str) -> bool:
+    """
+    处理 / 命令，返回 True 表示已处理。
+    """
+    cmd = command.strip().lower()
+
+    if cmd == "/help":
+        text = (
+            "可用命令：\n"
+            "/reset — 清除当前会话，重新开始\n"
+            "/status — 查看当前会话状态\n"
+            "/trust — 查看已信任的工具列表\n"
+            "/trust clear — 清除已信任的工具\n"
+            "/help — 显示本帮助"
+        )
+    elif cmd == "/reset":
+        session_id = get_session(chat_id)
+        delete_session(chat_id)
+        permission_manager.session_permissions.clear(chat_id)
+        text = "会话已重置，下次消息将开启新对话。"
+        if session_id:
+            text += f"\n（旧 session: {session_id[:8]}...）"
+    elif cmd == "/status":
+        session_id = get_session(chat_id)
+        trusted = permission_manager.session_permissions._store.get(chat_id, set())
+        is_busy = chat_id in _active_queues
+        text = (
+            f"会话状态：\n"
+            f"  session: {session_id[:8] + '...' if session_id else '无（新会话）'}\n"
+            f"  已信任工具: {', '.join(sorted(trusted)) if trusted else '无'}\n"
+            f"  处理中: {'是' if is_busy else '否'}"
+        )
+    elif cmd == "/trust":
+        trusted = permission_manager.session_permissions._store.get(chat_id, set())
+        if trusted:
+            text = f"已信任的工具: {', '.join(sorted(trusted))}\n\n发送 /trust clear 可清除"
+        else:
+            text = "当前没有已信任的工具，所有非只读操作都会请求授权。"
+    elif cmd == "/trust clear":
+        permission_manager.session_permissions.clear(chat_id)
+        text = "已清除所有信任的工具，后续操作将重新请求授权。"
+    else:
+        return False
+
+    if chat_type == "group":
+        reply_message(message_id, text)
+    else:
+        send_message(chat_id, text)
+    return True
 
 
 def chat_with_claude(chat_id: str, message: str) -> str:
@@ -163,7 +216,12 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
             return
 
         chat_id = message.chat_id
-        logger.info(f"收到消息: {message_id}: {text}")
+        logger.info(f"收到消息: {message_id} from={sender_id}: {text}")
+
+        # ── 斜杠命令路由 ──
+        if text.startswith("/"):
+            if _handle_command(chat_id, message_id, message.chat_type, text):
+                return
 
         # 👀 立刻标记正在处理
         reaction_id = None
