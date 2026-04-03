@@ -48,13 +48,24 @@ def _handle_command(chat_id: str, message_id: str, chat_type: str, command: str)
     """
     处理 / 命令，返回 True 表示已处理。
     """
-    cmd = command.strip().lower()
+    parts = command.strip().split(None, 1)
+    cmd = parts[0].lower()
+    arg = parts[1].strip() if len(parts) > 1 else ""
+
+    AVAILABLE_MODELS = {
+        "opus": "claude-opus-4-6",
+        "sonnet": "claude-sonnet-4-6",
+        "haiku": "claude-haiku-4-5-20251001",
+    }
 
     if cmd == "/help":
+        model_list = "  ".join(AVAILABLE_MODELS.keys())
         text = (
             "可用命令：\n"
             "/reset — 清除当前会话，重新开始\n"
             "/status — 查看当前会话状态\n"
+            "/model — 查看/切换模型\n"
+            f"/model <{model_list}> — 切换模型\n"
             "/trust — 查看已信任的工具列表\n"
             "/trust clear — 清除已信任的工具\n"
             "/help — 显示本帮助"
@@ -70,21 +81,35 @@ def _handle_command(chat_id: str, message_id: str, chat_type: str, command: str)
         session_id = get_session(chat_id)
         trusted = permission_manager.session_permissions._store.get(chat_id, set())
         is_busy = chat_id in _active_queues
+        model = os.getenv("DEFAULT_LLM_MODEL", "默认")
         text = (
             f"会话状态：\n"
+            f"  模型: {model}\n"
             f"  session: {session_id[:8] + '...' if session_id else '无（新会话）'}\n"
             f"  已信任工具: {', '.join(sorted(trusted)) if trusted else '无'}\n"
             f"  处理中: {'是' if is_busy else '否'}"
         )
-    elif cmd == "/trust":
-        trusted = permission_manager.session_permissions._store.get(chat_id, set())
-        if trusted:
-            text = f"已信任的工具: {', '.join(sorted(trusted))}\n\n发送 /trust clear 可清除"
+    elif cmd == "/model":
+        current = os.getenv("DEFAULT_LLM_MODEL", "默认")
+        if not arg:
+            model_list = "\n".join(f"  {k} → {v}" for k, v in AVAILABLE_MODELS.items())
+            text = f"当前模型: {current}\n\n可选模型：\n{model_list}\n\n用法: /model opus"
+        elif arg.lower() in AVAILABLE_MODELS:
+            new_model = AVAILABLE_MODELS[arg.lower()]
+            os.environ["DEFAULT_LLM_MODEL"] = new_model
+            text = f"模型已切换: {current} → {new_model}\n（新会话生效，建议 /reset）"
         else:
-            text = "当前没有已信任的工具，所有非只读操作都会请求授权。"
-    elif cmd == "/trust clear":
-        permission_manager.session_permissions.clear(chat_id)
-        text = "已清除所有信任的工具，后续操作将重新请求授权。"
+            text = f"未知模型: {arg}\n可选: {', '.join(AVAILABLE_MODELS.keys())}"
+    elif cmd == "/trust":
+        if arg.lower() == "clear":
+            permission_manager.session_permissions.clear(chat_id)
+            text = "已清除所有信任的工具，后续操作将重新请求授权。"
+        else:
+            trusted = permission_manager.session_permissions._store.get(chat_id, set())
+            if trusted:
+                text = f"已信任的工具: {', '.join(sorted(trusted))}\n\n发送 /trust clear 可清除"
+            else:
+                text = "当前没有已信任的工具，所有非只读操作都会请求授权。"
     else:
         return False
 
