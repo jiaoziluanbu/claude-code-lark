@@ -222,8 +222,30 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
             return
 
         # 解析消息内容
+        msg_type = message.message_type
         content = json.loads(message.content)
-        text = content.get("text", "")
+        text = ""
+
+        if msg_type == "text":
+            text = content.get("text", "")
+        elif msg_type == "post":
+            # 富文本消息：提取所有文本段落
+            post = content.get("content", [])
+            # post 结构: [[{"tag":"text","text":"..."},{"tag":"at",...}], [...]]
+            lines = []
+            for paragraph in post:
+                parts = []
+                for element in paragraph:
+                    tag = element.get("tag", "")
+                    if tag == "text":
+                        parts.append(element.get("text", ""))
+                    elif tag == "a":
+                        parts.append(element.get("href", ""))
+                lines.append("".join(parts))
+            text = "\n".join(lines)
+        else:
+            logger.info(f"不支持的消息类型: {msg_type}")
+            return
 
         # 去掉 @机器人
         if message.mentions:
