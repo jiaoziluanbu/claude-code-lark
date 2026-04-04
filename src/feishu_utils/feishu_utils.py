@@ -74,6 +74,50 @@ def remove_reaction(message_id, reaction_id, access_token=None):
     return res
 
 
+def download_message_resource(message_id, file_key, res_type="image", access_token=None):
+    """
+    下载消息中的资源文件（图片/文件）
+
+    Args:
+        message_id: 消息 ID
+        file_key: 资源 key（image_key 或 file_key）
+        res_type: 资源类型，"image" 或 "file"
+
+    Returns:
+        本地文件路径，失败返回 None
+    """
+    if access_token is None:
+        access_token = get_tenant_access_token()
+
+    url = f'https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/resources/{file_key}'
+    params = {'type': res_type}
+    res = requests.get(url, headers=get_headers(access_token), params=params, stream=True)
+
+    if res.status_code != 200:
+        return None
+
+    # 从 Content-Disposition 或 Content-Type 推断扩展名
+    content_type = res.headers.get('Content-Type', '')
+    ext_map = {
+        'image/png': '.png',
+        'image/jpeg': '.jpg',
+        'image/gif': '.gif',
+        'image/webp': '.webp',
+        'application/pdf': '.pdf',
+    }
+    ext = ext_map.get(content_type, '.bin')
+
+    save_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'data', 'downloads')
+    os.makedirs(save_dir, exist_ok=True)
+    file_path = os.path.join(save_dir, f'{file_key}{ext}')
+
+    with open(file_path, 'wb') as f:
+        for chunk in res.iter_content(chunk_size=8192):
+            f.write(chunk)
+
+    return file_path
+
+
 def get_department_member_list(department_id, access_token=None):
     if access_token is None:
         access_token = get_tenant_access_token()

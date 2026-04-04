@@ -20,7 +20,7 @@ import lark_oapi as lark
 from lark_oapi.api.im.v1 import *
 
 from src.claude_code import chat_sync
-from src.feishu_utils.feishu_utils import send_message, reply_message, add_reaction, remove_reaction
+from src.feishu_utils.feishu_utils import send_message, reply_message, add_reaction, remove_reaction, download_message_resource
 from src.data_base_utils import get_session, save_session, delete_session
 from src.security import is_user_allowed, PermissionManager
 
@@ -243,6 +243,31 @@ def handle_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                         parts.append(element.get("href", ""))
                 lines.append("".join(parts))
             text = "\n".join(lines)
+        elif msg_type == "image":
+            # 图片消息：下载到本地，让 Claude 通过 Read 工具查看
+            image_key = content.get("image_key", "")
+            if image_key:
+                file_path = download_message_resource(message_id, image_key, "image")
+                if file_path:
+                    text = f"用户发了一张图片，已保存到本地: {file_path}\n请用 Read 工具查看这张图片并描述/分析内容。"
+                else:
+                    text = "用户发了一张图片，但下载失败。"
+            else:
+                logger.info(f"图片消息缺少 image_key")
+                return
+        elif msg_type == "file":
+            # 文件消息：下载到本地
+            file_key = content.get("file_key", "")
+            file_name = content.get("file_name", "未知文件")
+            if file_key:
+                file_path = download_message_resource(message_id, file_key, "file")
+                if file_path:
+                    text = f"用户发了一个文件「{file_name}」，已保存到本地: {file_path}\n请读取并处理这个文件。"
+                else:
+                    text = f"用户发了一个文件「{file_name}」，但下载失败。"
+            else:
+                logger.info(f"文件消息缺少 file_key")
+                return
         else:
             logger.info(f"不支持的消息类型: {msg_type}")
             return
