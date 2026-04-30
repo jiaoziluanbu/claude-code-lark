@@ -13,16 +13,37 @@ load_dotenv()  # 必须在导入其他模块之前加载
 
 import json
 import logging
+import subprocess
 import threading
 from queue import Queue
 
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import *
 
-from src.claude_code import chat_sync
+from src.claude_code import chat_sync, set_default_model, get_default_model
 from src.feishu_utils.feishu_utils import send_message, reply_message, add_reaction, remove_reaction, download_message_resource
 from src.data_base_utils import get_session, save_session, delete_session
+
 from src.security import is_user_allowed, PermissionManager
+
+# Claude API 图片超限错误特征
+_IMAGE_LIMIT_ERROR = "exceeds the dimension limit"
+# Claude Code 登录失效特征
+_NOT_LOGGED_IN = "Not logged in"
+
+_SERVICE_DIR = str(Path(__file__).parent.parent)
+
+
+def _trigger_self_restart():
+    """后台延迟 5 秒重启服务（先让当前回复发出去，再杀自己）"""
+    def _do_restart():
+        import time
+        time.sleep(5)
+        subprocess.Popen(
+            ["bash", "-c", f"cd {_SERVICE_DIR} && ./stop.sh && sleep 1 && ./start.sh >> log.log 2>&1"],
+            close_fds=True,
+        )
+    threading.Thread(target=_do_restart, daemon=True).start()
 
 APP_ID = os.getenv("APP_ID")
 APP_SECRET = os.getenv("APP_SECRET")
@@ -53,7 +74,7 @@ def _handle_command(chat_id: str, message_id: str, chat_type: str, command: str)
     arg = parts[1].strip() if len(parts) > 1 else ""
 
     AVAILABLE_MODELS = {
-        "opus": "claude-opus-4-6",
+        "opus": "claude-opus-4-7",
         "sonnet": "claude-sonnet-4-6",
         "haiku": "claude-haiku-4-5-20251001",
     }
@@ -81,7 +102,7 @@ def _handle_command(chat_id: str, message_id: str, chat_type: str, command: str)
         session_id = get_session(chat_id)
         trusted = permission_manager.session_permissions._store.get(chat_id, set())
         is_busy = chat_id in _active_queues
-        model = os.getenv("DEFAULT_LLM_MODEL", "默认")
+        model = get_default_model()
         text = (
             f"会话状态：\n"
             f"  模型: {model}\n"
@@ -90,13 +111,13 @@ def _handle_command(chat_id: str, message_id: str, chat_type: str, command: str)
             f"  处理中: {'是' if is_busy else '否'}"
         )
     elif cmd == "/model":
-        current = os.getenv("DEFAULT_LLM_MODEL", "默认")
+        current = get_default_model()
         if not arg:
             model_list = "\n".join(f"  {k} → {v}" for k, v in AVAILABLE_MODELS.items())
             text = f"当前模型: {current}\n\n可选模型：\n{model_list}\n\n用法: /model opus"
         elif arg.lower() in AVAILABLE_MODELS:
             new_model = AVAILABLE_MODELS[arg.lower()]
-            os.environ["DEFAULT_LLM_MODEL"] = new_model
+            set_default_model(new_model)
             text = f"模型已切换: {current} → {new_model}\n（新会话生效，建议 /reset）"
         else:
             text = f"未知模型: {arg}\n可选: {', '.join(AVAILABLE_MODELS.keys())}"
@@ -122,20 +143,32 @@ def _handle_command(chat_id: str, message_id: str, chat_type: str, command: str)
 
 def chat_with_claude(chat_id: str, message: str) -> str:
     """
-    调用 Claude Code，基于 chat_id 保持对话连续性
+    调用 Claude Code，基于 chat_id 保持对话连续性。
+    若遇到图片超限错误，自动清除 session 并用新会话重试一次。
     """
-    # 从 SQLite 获取之前的 session_id
+    def _do_chat(session_id):
+        can_use_tool = permission_manager.make_callback(chat_id)
+        return chat_sync(message, session_id=session_id, can_use_tool=can_use_tool)
+
     session_id = get_session(chat_id)
+    reply, new_session_id = _do_chat(session_id)
 
-    # 创建带授权回调的 canUseTool
-    can_use_tool = permission_manager.make_callback(chat_id)
+    # 登录失效：通知用户并触发自动重启
+    if _NOT_LOGGED_IN in reply:
+        logger.warning(f"[{chat_id[:8]}] 检测到登录失效，触发自动重启")
+        delete_session(chat_id)
+        _trigger_self_restart()
+        return "⚠️ 检测到登录态失效，正在自动重启服务，约 10 秒后恢复，请稍后重发消息。"
 
-    # 调用 Claude
-    reply, new_session_id = chat_sync(
-        message,
-        session_id=session_id,
-        can_use_tool=can_use_tool,
-    )
+    # 图片超限：清掉旧 session，用新会话重试一次
+    if _IMAGE_LIMIT_ERROR in reply:
+        logger.warning(f"[{chat_id[:8]}] 图片超限，清除 session 后重试")
+        delete_session(chat_id)
+        permission_manager.session_permissions.clear(chat_id)
+        retry_msg = f"（上一个会话因图片过大已自动重置）\n{message}"
+        reply, new_session_id = _do_chat(None)
+        # 把重试结果前加提示
+        reply = f"⚠️ 会话已自动重置（图片超过 2000px 限制）\n\n{reply}"
 
     # 保存到 SQLite
     if new_session_id != session_id:

@@ -115,6 +115,19 @@ def download_message_resource(message_id, file_key, res_type="image", access_tok
         for chunk in res.iter_content(chunk_size=8192):
             f.write(chunk)
 
+    # 图片超过 1200px 时缩小，避免 Claude API "2000px" 超限错误
+    if ext in ('.png', '.jpg', '.webp'):
+        try:
+            from PIL import Image
+            img = Image.open(file_path)
+            w, h = img.size
+            if max(w, h) > 1200:
+                ratio = 1200 / max(w, h)
+                img = img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
+                img.save(file_path)
+        except Exception:
+            pass  # 缩放失败不影响主流程
+
     return file_path
 
 
