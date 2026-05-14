@@ -15,6 +15,7 @@ import json
 import logging
 import subprocess
 import threading
+from dataclasses import dataclass
 from queue import Queue
 
 import lark_oapi as lark
@@ -35,6 +36,7 @@ from src.data_base_utils import (
     delete_agent_session,
     get_chat_setting,
     save_chat_setting,
+    delete_chat_setting,
 )
 
 from src.security import is_user_allowed, PermissionManager
@@ -144,6 +146,80 @@ def _get_cwd(chat_id: str) -> Path:
     return _resolve_cwd(get_chat_setting(chat_id, "cwd"))
 
 
+@dataclass
+class PendingSwitch:
+    kind: str
+    current_backend: str
+    target_backend: str
+    current_model: str
+    target_model: str | None = None
+
+
+def _pending_switch_key() -> str:
+    return "pending_switch"
+
+
+def _load_pending_switch(chat_id: str) -> PendingSwitch | None:
+    raw = get_chat_setting(chat_id, _pending_switch_key())
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        return PendingSwitch(
+            kind=str(data["kind"]),
+            current_backend=str(data["current_backend"]),
+            target_backend=str(data["target_backend"]),
+            current_model=str(data["current_model"]),
+            target_model=data.get("target_model"),
+        )
+    except Exception:
+        delete_chat_setting(chat_id, _pending_switch_key())
+        return None
+
+
+def _save_pending_switch(chat_id: str, pending: PendingSwitch):
+    save_chat_setting(
+        chat_id,
+        _pending_switch_key(),
+        json.dumps(pending.__dict__, ensure_ascii=False),
+    )
+
+
+def _clear_pending_switch(chat_id: str):
+    delete_chat_setting(chat_id, _pending_switch_key())
+
+
+def _pending_switch_text(pending: PendingSwitch) -> str:
+    if pending.kind == "backend":
+        target = f"后端 {pending.target_backend}"
+        current = f"当前后端 {pending.current_backend}"
+    else:
+        target = f"{pending.target_backend} 模型 {pending.target_model}"
+        current = f"当前模型 {pending.current_model}"
+    return (
+        f"准备切换到 {target}。\n\n"
+        f"注意：切换后不会继承 {current} 的原生会话上下文；"
+        "旧会话会保留，之后切回来还能继续。\n\n"
+        "输入 /switch apply 确认切换。\n"
+        "输入 /switch cancel 继续使用当前设置。"
+    )
+
+
+def _apply_pending_switch(chat_id: str, pending: PendingSwitch) -> str:
+    if pending.kind == "backend":
+        save_chat_setting(chat_id, "backend", pending.target_backend)
+        return f"已切换后端: {pending.current_backend} → {pending.target_backend}"
+
+    target_model = pending.target_model or get_default_model(pending.target_backend)
+    save_chat_setting(chat_id, _model_setting_key(pending.target_backend), target_model)
+    delete_agent_session(chat_id, pending.target_backend)
+    return (
+        f"{pending.target_backend} 模型已切换: "
+        f"{pending.current_model} → {target_model}\n"
+        "已重置当前后端 session。"
+    )
+
+
 # ── 斜杠命令 ──
 
 def _handle_command(chat_id: str, message_id: str, chat_type: str, command: str) -> bool:
@@ -163,6 +239,8 @@ def _handle_command(chat_id: str, message_id: str, chat_type: str, command: str)
             "/status — 查看当前会话状态\n"
             "/backend — 查看/切换后端（claude/codex）\n"
             "/backend <claude|codex> — 切换后端\n"
+            "/switch apply — 确认待执行的后端/模型切换\n"
+            "/switch cancel — 放弃待执行的后端/模型切换\n"
             "/cwd — 查看 Codex 工作目录\n"
             "/cwd <路径> — 切换 Codex 工作目录，可用相对路径\n"
             "/sandbox — 查看/切换 Codex 权限\n"
@@ -193,6 +271,7 @@ def _handle_command(chat_id: str, message_id: str, chat_type: str, command: str)
     elif cmd == "/status":
         trusted = permission_manager.session_permissions._store.get(chat_id, set())
         is_busy = chat_id in _active_queues
+        pending = _load_pending_switch(chat_id)
         if is_zhao:
             session_id = get_agent_session(chat_id, "claude")
             text = (
@@ -214,6 +293,7 @@ def _handle_command(chat_id: str, message_id: str, chat_type: str, command: str)
                 f"  Codex cwd: {cwd}\n"
                 f"  Codex sandbox: {sandbox}\n"
                 f"  session: {session_id[:8] + '...' if session_id else '无（新会话）'}\n"
+                f"  待确认切换: {'有' if pending else '无'}\n"
                 f"  已信任工具: {', '.join(sorted(trusted)) if trusted else '无'}\n"
                 f"  处理中: {'是' if is_busy else '否'}"
             )
@@ -223,6 +303,19 @@ def _handle_command(chat_id: str, message_id: str, chat_type: str, command: str)
             "远程开发命令（/backend、/cwd、/sandbox、/trust）不作用于昭；"
             "昭的模型由 podcast-cohost 的 model_registry 管理。"
         )
+    elif cmd == "/switch":
+        pending = _load_pending_switch(chat_id)
+        action = arg.lower()
+        if not pending:
+            text = "当前没有待确认的后端/模型切换。"
+        elif action in {"apply", "yes", "y", "确认"}:
+            text = _apply_pending_switch(chat_id, pending)
+            _clear_pending_switch(chat_id)
+        elif action in {"cancel", "no", "n", "取消"}:
+            _clear_pending_switch(chat_id)
+            text = "已取消切换，继续使用当前后端和模型。"
+        else:
+            text = _pending_switch_text(pending)
     elif cmd == "/backend":
         if not arg:
             text = (
@@ -234,9 +327,18 @@ def _handle_command(chat_id: str, message_id: str, chat_type: str, command: str)
             new_backend = normalize_backend(arg)
             if new_backend not in SUPPORTED_BACKENDS:
                 text = f"未知后端: {arg}\n可选: {', '.join(SUPPORTED_BACKENDS)}"
+            elif new_backend == backend:
+                _clear_pending_switch(chat_id)
+                text = f"当前已经是 {backend} 后端。"
             else:
-                save_chat_setting(chat_id, "backend", new_backend)
-                text = f"后端已切换: {backend} → {new_backend}"
+                pending = PendingSwitch(
+                    kind="backend",
+                    current_backend=backend,
+                    target_backend=new_backend,
+                    current_model=_get_model(chat_id, backend),
+                )
+                _save_pending_switch(chat_id, pending)
+                text = _pending_switch_text(pending)
     elif cmd == "/cwd":
         if not arg:
             text = (
@@ -277,9 +379,19 @@ def _handle_command(chat_id: str, message_id: str, chat_type: str, command: str)
             text = f"当前后端: {backend}\n当前模型: {current}\n\n可选别名：\n{model_list}\n\n也可以直接输入完整模型名。"
         else:
             new_model = resolve_model_alias(backend, arg)
-            save_chat_setting(chat_id, _model_setting_key(backend), new_model)
-            delete_agent_session(chat_id, backend)
-            text = f"{backend} 模型已切换: {current} → {new_model}\n已重置当前后端 session。"
+            if new_model == current:
+                _clear_pending_switch(chat_id)
+                text = f"当前 {backend} 已经在使用模型: {current}"
+            else:
+                pending = PendingSwitch(
+                    kind="model",
+                    current_backend=backend,
+                    target_backend=backend,
+                    current_model=current,
+                    target_model=new_model,
+                )
+                _save_pending_switch(chat_id, pending)
+                text = _pending_switch_text(pending)
     elif cmd == "/trust":
         if arg.lower() == "clear":
             permission_manager.session_permissions.clear(chat_id)

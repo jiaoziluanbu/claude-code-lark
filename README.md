@@ -41,6 +41,7 @@
 - 支持 Claude Code 和 Codex，两套 session 分开保存
 - **每个聊天窗口独立上下文**，群聊成员共享同一上下文
 - 可用 `/backend`、`/model`、`/cwd`、`/sandbox` 在飞书里切换运行方式
+- 后端/模型切换需要 `/switch apply` 二次确认，避免上下文突然断开
 - 飞书长连接方式，无需公网域名
 - 轻量级，Python 服务即可运行
 
@@ -123,10 +124,12 @@ tail -f log.log
 
 ```text
 /backend                  查看当前后端
-/backend codex            切换到 Codex
-/backend claude           切换到 Claude Code
+/backend codex            准备切换到 Codex
+/backend claude           准备切换到 Claude Code
+/switch apply             确认待执行的后端/模型切换
+/switch cancel            取消待执行的后端/模型切换
 /model                    查看当前后端模型
-/model codex              切到 Codex 默认别名 gpt-5.3-codex
+/model codex              准备切到 Codex 默认别名 gpt-5.3-codex
 /cwd                      查看 Codex 工作目录
 /cwd PhotoCleaner         切到 ~/Documents/自制产品/PhotoCleaner
 /sandbox                  查看 Codex 权限
