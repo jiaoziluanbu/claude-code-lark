@@ -2,6 +2,7 @@
 Claude Code 连续对话客户端
 """
 import asyncio
+import os
 from typing import Optional, Callable, Any
 from dataclasses import dataclass
 
@@ -13,6 +14,23 @@ from claude_agent_sdk import (
     ToolUseBlock,
     ResultMessage,
 )
+
+
+# 默认模型（启动时从环境变量读，运行时通过 set_default_model 切换）
+# 不污染 os.environ，仅模块内部状态
+_DEFAULT_MODEL = os.getenv("DEFAULT_LLM_MODEL", "claude-sonnet-4-6")
+
+
+def set_default_model(model: str) -> str:
+    """运行时切换默认模型，返回旧值。"""
+    global _DEFAULT_MODEL
+    old = _DEFAULT_MODEL
+    _DEFAULT_MODEL = model
+    return old
+
+
+def get_default_model() -> str:
+    return _DEFAULT_MODEL
 
 
 @dataclass
@@ -75,6 +93,7 @@ class ConversationClient:
         permission_mode: str = "default",
         system_prompt: str = None,
         can_use_tool: Callable = None,
+        model: str = None,
     ):
         self._initial_session_id = session_id
         self.session_id: Optional[str] = session_id
@@ -82,6 +101,7 @@ class ConversationClient:
         self.permission_mode = permission_mode
         self.system_prompt = system_prompt or SYSTEM_PROMPT
         self._can_use_tool = can_use_tool
+        self.model = model
         self._client: Optional[ClaudeSDKClient] = None
 
     async def connect(self):
@@ -90,6 +110,7 @@ class ConversationClient:
             allowed_tools=self.allowed_tools,
             permission_mode=self.permission_mode,
             system_prompt={"type": "preset", "preset": "claude_code", "append": self.system_prompt},
+            model=self.model or _DEFAULT_MODEL,
         )
         if self._can_use_tool:
             options.can_use_tool = self._can_use_tool
@@ -146,6 +167,8 @@ def chat_sync(
     message: str,
     session_id: str = None,
     can_use_tool: Callable = None,
+    model: str = None,
+    **_: Any,
 ) -> tuple[str, str]:
     """
     同步调用 Claude Code（在独立线程中运行，避免事件循环冲突）
@@ -168,6 +191,7 @@ def chat_sync(
                 async with ConversationClient(
                     session_id=session_id,
                     can_use_tool=can_use_tool,
+                    model=model,
                 ) as client:
                     r = await client.chat(message)
                     return r.content, r.session_id

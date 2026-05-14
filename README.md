@@ -1,6 +1,6 @@
-# Claude Code 飞书机器人
+# remote-feishu
 
-将 Claude Code 接入飞书，实现本地电脑助手功能。
+通过飞书远程操作本机 Agent。当前支持 Claude Code 和 Codex 双后端，可在不同聊天里保留独立上下文、切换模型、指定工作目录，并把飞书变成一个轻量的远程开发入口。
 
 ## 核心特性
 
@@ -12,43 +12,46 @@
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│  飞书聊天窗口          Claude Code Session          │
+│  飞书聊天窗口          Agent Session               │
 ├─────────────────────────────────────────────────────┤
-│  张三 私聊  ────────►  session_abc (独立上下文)      │
-│  李四 私聊  ────────►  session_xyz (独立上下文)      │
-│  项目群聊   ────────►  session_123 (共享上下文)      │
-│  测试群聊   ────────►  session_456 (共享上下文)      │
+│  张三 私聊  ────────►  claude/codex session_abc      │
+│  李四 私聊  ────────►  claude/codex session_xyz      │
+│  项目群聊   ────────►  claude/codex session_123      │
+│  测试群聊   ────────►  claude/codex session_456      │
 └─────────────────────────────────────────────────────┘
 ```
 
-**本地电脑操作能力**
+**远程开发能力**
 
 - 文件读写、创建、删除
 - 执行 Shell/Python 脚本
 - 打开/关闭应用程序
 - Git 操作、包管理等开发任务
+- Claude Code / Codex 后端按聊天独立切换
+- Codex 可按聊天设置工作目录和 sandbox
 
 ## 与 ClawdBot 的比较
 
 | 特性 | 本项目 | ClawdBot |
 |------|--------|----------|
 | 聊天平台 | 飞书 | Slack/Discord |
-| AI 后端 | Claude Code (本地 CLI) | Claude API |
-| 核心能力 | **本地电脑操作** | 对话助手 |
+| AI 后端 | Claude Code / Codex (本地 CLI) | Claude API |
+| 核心能力 | **远程开发 + 本地电脑操作** | 对话助手 |
 | 连接方式 | 飞书长连接 WebSocket | Webhook |
 | 多用户支持 | **每个聊天独立上下文** | 全局/按用户 |
 | 会话管理 | SQLite 持久化 | 内存/Redis |
 
 **相似之处：**
-- 都是将 Claude 接入企业聊天工具
+- 都是将 Agent 接入企业聊天工具
 - 都支持多轮连续对话
 - 都通过 session/thread 管理对话上下文
 
 **本项目特色：**
-- 使用 Claude Code，可执行本地命令、操作文件
+- 支持 Claude Code 和 Codex，两套 session 分开保存
 - **每个聊天窗口独立上下文**，群聊成员共享同一上下文
+- 可用 `/backend`、`/model`、`/cwd`、`/sandbox` 在飞书里切换运行方式
 - 飞书长连接方式，无需公网域名
-- 轻量级，单文件即可运行
+- 轻量级，Python 服务即可运行
 
 ## 快速开始
 
@@ -70,7 +73,7 @@ APP_ID=cli_xxxxxx
 APP_SECRET=xxxxxx
 ```
 
-### 3. 安装 Claude Code
+### 3. 安装 Claude Code / Codex
 
 ```bash
 # macOS/Linux
@@ -81,6 +84,13 @@ npm install -g @anthropic-ai/claude-code
 
 # 登录
 claude login
+```
+
+如果要使用 Codex：
+
+```bash
+npm install -g @openai/codex
+codex login
 ```
 
 ### 4. 飞书应用配置
@@ -118,6 +128,23 @@ tail -f log.log
 @机器人 当前目录有哪些文件
 ```
 
+常用命令：
+
+```text
+/backend                  查看当前后端
+/backend codex            切换到 Codex
+/backend claude           切换到 Claude Code
+/model                    查看当前后端模型
+/model codex              切到 Codex 默认别名 gpt-5.3-codex
+/cwd                      查看 Codex 工作目录
+/cwd PhotoCleaner         切到 ~/Documents/自制产品/PhotoCleaner
+/sandbox                  查看 Codex 权限
+/sandbox workspace-write  降级到 workspace-write
+/sandbox danger           切回全权限远程开发
+/reset                    重置当前后端会话
+/reset all                重置 Claude 和 Codex 两边会话
+```
+
 ## 项目结构
 
 ```
@@ -125,6 +152,9 @@ tail -f log.log
 │   ├── main_websocket.py      # 主程序（飞书长连接）
 │   ├── claude_code/           # Claude Code 封装
 │   │   ├── conversation.py    # 对话客户端
+│   │   └── __init__.py
+│   ├── agent_backends/        # Claude/Codex 后端统一入口
+│   │   ├── codex_cli.py       # Codex CLI 后端
 │   │   └── __init__.py
 │   ├── feishu_utils/          # 飞书工具
 │   │   └── feishu_utils.py
@@ -146,7 +176,7 @@ tail -f log.log
 
 ## 扩展其他 Agent
 
-本项目采用模块化设计，可轻松替换或扩展后端 Agent：
+本项目采用模块化设计，可轻松扩展后端 Agent：
 
 ```
 ┌──────────────┐      ┌─────────────────┐      ┌────────────────────┐
@@ -157,40 +187,39 @@ tail -f log.log
                               ┌──────────────────────────┼──────────────────────────┐
                               ▼                          ▼                          ▼
                       ┌──────────────┐          ┌──────────────┐          ┌──────────────┐
-                      │ Claude Code  │          │   OpenAI     │          │  自定义 Agent │
-                      │ (当前实现)    │          │   Agent      │          │              │
+                      │ Claude Code  │          │    Codex     │          │  自定义 Agent │
+                      │              │          │              │          │              │
                       └──────────────┘          └──────────────┘          └──────────────┘
 ```
 
 **扩展方式**
 
-只需实现一个 `chat_sync(message, session_id)` 函数：
+只需实现一个 `chat_sync(...)` 函数，并在 `src/agent_backends/__init__.py` 注册：
 
 ```python
-# src/your_agent/client.py
+# src/agent_backends/your_agent.py
 
-def chat_sync(message: str, session_id: str = None) -> tuple[str, str]:
+def chat_sync(
+    message: str,
+    session_id: str = None,
+    cwd: str = None,
+    model: str = None,
+    sandbox: str = None,
+    **kwargs,
+) -> tuple[str, str]:
     """
     Args:
         message: 用户消息
         session_id: 会话 ID（用于保持上下文）
+        cwd: 工作目录
+        model: 模型名
+        sandbox: 权限策略
     
     Returns:
         (回复内容, 新的 session_id)
     """
-    # 你的 Agent 实现
     reply = your_agent.chat(message, session_id)
     return reply, session_id
-```
-
-然后在 `main_websocket.py` 中替换导入：
-
-```python
-# 替换这行
-from src.claude_code import chat_sync
-
-# 改为
-from src.your_agent import chat_sync
 ```
 
 **可扩展的 Agent 示例**
@@ -198,6 +227,7 @@ from src.your_agent import chat_sync
 | Agent | 能力 | 适用场景 |
 |-------|------|---------|
 | Claude Code | 本地文件/命令操作 | 开发助手、自动化 |
+| Codex | 本地远程开发、代码修改、测试 | 编程、重构、调试 |
 | OpenAI Assistants | 对话 + 代码解释器 | 数据分析、问答 |
 | LangChain Agent | 自定义工具链 | 复杂工作流 |
 | Dify/Coze | 可视化编排 | 快速原型 |

@@ -20,9 +20,22 @@ from queue import Queue
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import *
 
-from src.claude_code import chat_sync, set_default_model, get_default_model
+from src.agent_backends import (
+    SUPPORTED_BACKENDS,
+    MODEL_ALIASES,
+    chat_sync,
+    get_default_model,
+    normalize_backend,
+    resolve_model_alias,
+)
 from src.feishu_utils.feishu_utils import send_message, reply_message, add_reaction, remove_reaction, download_message_resource
-from src.data_base_utils import get_session, save_session, delete_session
+from src.data_base_utils import (
+    get_agent_session,
+    save_agent_session,
+    delete_agent_session,
+    get_chat_setting,
+    save_chat_setting,
+)
 
 from src.security import is_user_allowed, PermissionManager
 
@@ -63,6 +76,74 @@ _active_queues: dict[str, Queue] = {}
 _queue_lock = threading.Lock()
 
 
+DEFAULT_BACKEND = normalize_backend(os.getenv("DEFAULT_AGENT_BACKEND", "claude"))
+DEFAULT_SANDBOX = os.getenv("CODEX_DEFAULT_SANDBOX", "danger-full-access")
+DEFAULT_CWD = os.getenv(
+    "CODEX_DEFAULT_CWD",
+    str(Path.home() / "Documents" / "自制产品"),
+)
+WORKSPACE_ROOTS = [
+    Path(p.strip()).expanduser()
+    for p in os.getenv(
+        "CODEX_WORKSPACE_ROOTS",
+        f"{Path.home() / 'Documents' / '自制产品'},{Path.home()}",
+    ).split(",")
+    if p.strip()
+] or [Path.home()]
+
+
+def _get_backend(chat_id: str) -> str:
+    return normalize_backend(get_chat_setting(chat_id, "backend") or DEFAULT_BACKEND)
+
+
+def _model_setting_key(backend: str) -> str:
+    return f"model:{backend}"
+
+
+def _get_model(chat_id: str, backend: str) -> str:
+    return get_chat_setting(chat_id, _model_setting_key(backend)) or get_default_model(backend)
+
+
+def _get_sandbox(chat_id: str) -> str:
+    return get_chat_setting(chat_id, "codex_sandbox") or DEFAULT_SANDBOX
+
+
+def _is_inside(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _workspace_roots_text() -> str:
+    return "\n".join(f"  - {root}" for root in WORKSPACE_ROOTS)
+
+
+def _resolve_cwd(raw: str | None) -> Path:
+    value = (raw or DEFAULT_CWD).strip()
+    candidate = Path(value).expanduser()
+
+    if not candidate.is_absolute():
+        existing = [root / candidate for root in WORKSPACE_ROOTS if (root / candidate).exists()]
+        candidate = existing[0] if existing else WORKSPACE_ROOTS[0] / candidate
+
+    resolved = candidate.resolve()
+    roots = [root.resolve() for root in WORKSPACE_ROOTS]
+    if not any(_is_inside(resolved, root) for root in roots):
+        raise ValueError(f"工作目录必须位于允许的 workspace 内：\n{_workspace_roots_text()}")
+
+    if resolved.exists() and not resolved.is_dir():
+        raise ValueError(f"工作目录不是文件夹：{resolved}")
+
+    resolved.mkdir(parents=True, exist_ok=True)
+    return resolved
+
+
+def _get_cwd(chat_id: str) -> Path:
+    return _resolve_cwd(get_chat_setting(chat_id, "cwd"))
+
+
 # ── 斜杠命令 ──
 
 def _handle_command(chat_id: str, message_id: str, chat_type: str, command: str) -> bool:
@@ -72,55 +153,133 @@ def _handle_command(chat_id: str, message_id: str, chat_type: str, command: str)
     parts = command.strip().split(None, 1)
     cmd = parts[0].lower()
     arg = parts[1].strip() if len(parts) > 1 else ""
-
-    AVAILABLE_MODELS = {
-        "opus": "claude-opus-4-7",
-        "sonnet": "claude-sonnet-4-6",
-        "haiku": "claude-haiku-4-5-20251001",
-    }
+    backend = _get_backend(chat_id)
+    is_zhao = _is_zhao_chat(chat_id)
 
     if cmd == "/help":
-        model_list = "  ".join(AVAILABLE_MODELS.keys())
         text = (
             "可用命令：\n"
             "/reset — 清除当前会话，重新开始\n"
             "/status — 查看当前会话状态\n"
+            "/backend — 查看/切换后端（claude/codex）\n"
+            "/backend <claude|codex> — 切换后端\n"
+            "/cwd — 查看 Codex 工作目录\n"
+            "/cwd <路径> — 切换 Codex 工作目录，可用相对路径\n"
+            "/sandbox — 查看/切换 Codex 权限\n"
+            "/sandbox <read-only|workspace-write|danger-full-access> — 切换权限\n"
             "/model — 查看/切换模型\n"
-            f"/model <{model_list}> — 切换模型\n"
+            "/model <别名或模型名> — 切换当前后端模型\n"
             "/trust — 查看已信任的工具列表\n"
             "/trust clear — 清除已信任的工具\n"
             "/help — 显示本帮助"
         )
     elif cmd == "/reset":
-        session_id = get_session(chat_id)
-        delete_session(chat_id)
+        if is_zhao:
+            session_id = get_agent_session(chat_id, "claude")
+            delete_agent_session(chat_id, "claude")
+            text = "昭的对话 session 已重置，下次消息将重新开始。"
+        elif arg.lower() == "all":
+            for name in SUPPORTED_BACKENDS:
+                delete_agent_session(chat_id, name)
+            session_id = None
+            text = "所有后端会话已重置，下次消息将开启新对话。"
+        else:
+            session_id = get_agent_session(chat_id, backend)
+            delete_agent_session(chat_id, backend)
+            text = f"{backend} 会话已重置，下次消息将开启新对话。"
         permission_manager.session_permissions.clear(chat_id)
-        text = "会话已重置，下次消息将开启新对话。"
         if session_id:
             text += f"\n（旧 session: {session_id[:8]}...）"
     elif cmd == "/status":
-        session_id = get_session(chat_id)
         trusted = permission_manager.session_permissions._store.get(chat_id, set())
         is_busy = chat_id in _active_queues
-        model = get_default_model()
-        text = (
-            f"会话状态：\n"
-            f"  模型: {model}\n"
-            f"  session: {session_id[:8] + '...' if session_id else '无（新会话）'}\n"
-            f"  已信任工具: {', '.join(sorted(trusted)) if trusted else '无'}\n"
-            f"  处理中: {'是' if is_busy else '否'}"
-        )
-    elif cmd == "/model":
-        current = get_default_model()
-        if not arg:
-            model_list = "\n".join(f"  {k} → {v}" for k, v in AVAILABLE_MODELS.items())
-            text = f"当前模型: {current}\n\n可选模型：\n{model_list}\n\n用法: /model opus"
-        elif arg.lower() in AVAILABLE_MODELS:
-            new_model = AVAILABLE_MODELS[arg.lower()]
-            set_default_model(new_model)
-            text = f"模型已切换: {current} → {new_model}\n（新会话生效，建议 /reset）"
+        if is_zhao:
+            session_id = get_agent_session(chat_id, "claude")
+            text = (
+                f"会话状态：\n"
+                f"  路由: 昭（podcast-cohost）\n"
+                f"  session: {session_id[:8] + '...' if session_id else '无（新会话）'}\n"
+                f"  已信任工具: 不适用（昭不使用本机工具）\n"
+                f"  处理中: {'是' if is_busy else '否'}"
+            )
         else:
-            text = f"未知模型: {arg}\n可选: {', '.join(AVAILABLE_MODELS.keys())}"
+            session_id = get_agent_session(chat_id, backend)
+            model = _get_model(chat_id, backend)
+            cwd = _get_cwd(chat_id)
+            sandbox = _get_sandbox(chat_id)
+            text = (
+                f"会话状态：\n"
+                f"  后端: {backend}\n"
+                f"  模型: {model}\n"
+                f"  Codex cwd: {cwd}\n"
+                f"  Codex sandbox: {sandbox}\n"
+                f"  session: {session_id[:8] + '...' if session_id else '无（新会话）'}\n"
+                f"  已信任工具: {', '.join(sorted(trusted)) if trusted else '无'}\n"
+                f"  处理中: {'是' if is_busy else '否'}"
+            )
+    elif is_zhao and cmd in {"/backend", "/cwd", "/sandbox", "/model", "/trust"}:
+        text = (
+            "这个聊天已绑定到昭路由。\n"
+            "远程开发命令（/backend、/cwd、/sandbox、/trust）不作用于昭；"
+            "昭的模型由 podcast-cohost 的 model_registry 管理。"
+        )
+    elif cmd == "/backend":
+        if not arg:
+            text = (
+                f"当前后端: {backend}\n"
+                f"可选: {', '.join(SUPPORTED_BACKENDS)}\n\n"
+                "用法: /backend codex"
+            )
+        else:
+            new_backend = normalize_backend(arg)
+            if new_backend not in SUPPORTED_BACKENDS:
+                text = f"未知后端: {arg}\n可选: {', '.join(SUPPORTED_BACKENDS)}"
+            else:
+                save_chat_setting(chat_id, "backend", new_backend)
+                text = f"后端已切换: {backend} → {new_backend}"
+    elif cmd == "/cwd":
+        if not arg:
+            text = (
+                f"当前 Codex 工作目录:\n{_get_cwd(chat_id)}\n\n"
+                f"允许的 workspace:\n{_workspace_roots_text()}\n\n"
+                "用法: /cwd PhotoCleaner 或 /cwd ~/Documents/自制产品/PhotoCleaner"
+            )
+        else:
+            try:
+                cwd = _resolve_cwd(arg)
+                save_chat_setting(chat_id, "cwd", str(cwd))
+                delete_agent_session(chat_id, "codex")
+                text = f"Codex 工作目录已切换:\n{cwd}\n\n已重置当前聊天的 Codex session。"
+            except Exception as e:
+                text = f"切换工作目录失败：{e}"
+    elif cmd == "/sandbox":
+        allowed = {"read-only", "workspace-write", "danger-full-access", "danger"}
+        if not arg:
+            text = (
+                f"当前 Codex sandbox: {_get_sandbox(chat_id)}\n"
+                "可选: read-only, workspace-write, danger-full-access\n\n"
+                "用法: /sandbox danger-full-access"
+            )
+        else:
+            value = "danger-full-access" if arg.lower() == "danger" else arg.lower()
+            if value not in allowed:
+                text = "未知 sandbox。可选: read-only, workspace-write, danger-full-access"
+            else:
+                save_chat_setting(chat_id, "codex_sandbox", value)
+                delete_agent_session(chat_id, "codex")
+                text = f"Codex sandbox 已切换为: {value}\n已重置当前聊天的 Codex session。"
+    elif cmd == "/model":
+        model = _get_model(chat_id, backend)
+        current = model
+        aliases = MODEL_ALIASES.get(backend, {})
+        if not arg:
+            model_list = "\n".join(f"  {k} → {v}" for k, v in aliases.items())
+            text = f"当前后端: {backend}\n当前模型: {current}\n\n可选别名：\n{model_list}\n\n也可以直接输入完整模型名。"
+        else:
+            new_model = resolve_model_alias(backend, arg)
+            save_chat_setting(chat_id, _model_setting_key(backend), new_model)
+            delete_agent_session(chat_id, backend)
+            text = f"{backend} 模型已切换: {current} → {new_model}\n已重置当前后端 session。"
     elif cmd == "/trust":
         if arg.lower() == "clear":
             permission_manager.session_permissions.clear(chat_id)
@@ -141,39 +300,87 @@ def _handle_command(chat_id: str, message_id: str, chat_type: str, command: str)
     return True
 
 
-def chat_with_claude(chat_id: str, message: str) -> str:
-    """
-    调用 Claude Code，基于 chat_id 保持对话连续性。
-    若遇到图片超限错误，自动清除 session 并用新会话重试一次。
-    """
-    def _do_chat(session_id):
-        can_use_tool = permission_manager.make_callback(chat_id)
-        return chat_sync(message, session_id=session_id, can_use_tool=can_use_tool)
+# ===== 昭（podcast-cohost）路由 =====
+# 当 chat_id 在 ZHAO_CHAT_IDS 环境变量里（逗号分隔），走昭的 chat_sync
+# 否则走默认 Claude Code
+import os as _os
+import sys as _sys
+_ZHAO_CHAT_IDS = set(filter(None, _os.environ.get("ZHAO_CHAT_IDS", "").split(",")))
+_ZHAO_PROJECT_PATH = _os.environ.get(
+    "ZHAO_PROJECT_PATH",
+    _os.path.expanduser("~/Documents/自制产品/podcast-cohost"),
+)
+_zhao_chat_sync = None
+if _ZHAO_CHAT_IDS and _os.path.isdir(_ZHAO_PROJECT_PATH):
+    if _ZHAO_PROJECT_PATH not in _sys.path:
+        _sys.path.insert(0, _ZHAO_PROJECT_PATH)
+    try:
+        from engine.zhao_chat_sync import chat_sync as _zhao_chat_sync
+        logger.info(f"[zhao] 已启用，监听 chat_ids: {_ZHAO_CHAT_IDS}")
+    except Exception as _e:
+        logger.warning(f"[zhao] 路由加载失败，回退到默认: {_e}")
 
-    session_id = get_session(chat_id)
+
+def _is_zhao_chat(chat_id: str) -> bool:
+    return _zhao_chat_sync is not None and chat_id in _ZHAO_CHAT_IDS
+
+
+def chat_with_agent(chat_id: str, message: str) -> str:
+    """
+    调用当前 Agent 后端，基于 chat_id 保持对话连续性。
+    若遇到图片超限错误，自动清除 session 并用新会话重试一次。
+
+    若 chat_id 在 ZHAO_CHAT_IDS，走昭的 chat_sync（人格/情绪/记忆系统）。
+    """
+    is_zhao = _is_zhao_chat(chat_id)
+    backend = "claude" if is_zhao else _get_backend(chat_id)
+    model = _get_model(chat_id, backend)
+    cwd = str(_get_cwd(chat_id))
+    sandbox = _get_sandbox(chat_id)
+
+    def _do_chat(session_id):
+        if is_zhao:
+            result = _zhao_chat_sync(message, session_id=session_id)
+            if isinstance(result, tuple) and len(result) >= 2:
+                return result[0], result[1]
+            return str(result), session_id or ""
+        can_use_tool = permission_manager.make_callback(chat_id)
+        return chat_sync(
+            backend,
+            message,
+            session_id=session_id,
+            can_use_tool=can_use_tool,
+            cwd=cwd,
+            model=model,
+            sandbox=sandbox,
+        )
+
+    session_id = get_agent_session(chat_id, backend)
     reply, new_session_id = _do_chat(session_id)
 
     # 登录失效：通知用户并触发自动重启
-    if _NOT_LOGGED_IN in reply:
+    if backend == "claude" and _NOT_LOGGED_IN in reply:
         logger.warning(f"[{chat_id[:8]}] 检测到登录失效，触发自动重启")
-        delete_session(chat_id)
+        delete_agent_session(chat_id, backend)
         _trigger_self_restart()
         return "⚠️ 检测到登录态失效，正在自动重启服务，约 10 秒后恢复，请稍后重发消息。"
+    if backend == "codex" and ("not logged in" in reply.lower() or "codex login" in reply.lower()):
+        delete_agent_session(chat_id, backend)
+        return "⚠️ Codex 登录态可能失效。请在本机终端运行 `codex login` 后重试。"
 
     # 图片超限：清掉旧 session，用新会话重试一次
     if _IMAGE_LIMIT_ERROR in reply:
         logger.warning(f"[{chat_id[:8]}] 图片超限，清除 session 后重试")
-        delete_session(chat_id)
+        delete_agent_session(chat_id, backend)
         permission_manager.session_permissions.clear(chat_id)
-        retry_msg = f"（上一个会话因图片过大已自动重置）\n{message}"
         reply, new_session_id = _do_chat(None)
         # 把重试结果前加提示
         reply = f"⚠️ 会话已自动重置（图片超过 2000px 限制）\n\n{reply}"
 
     # 保存到 SQLite
-    if new_session_id != session_id:
-        save_session(chat_id, new_session_id)
-        logger.info(f"会话映射: {chat_id[:8]}... -> {new_session_id[:8]}...")
+    if new_session_id and new_session_id != session_id:
+        save_agent_session(chat_id, backend, new_session_id)
+        logger.info(f"会话映射: {backend}:{chat_id[:8]}... -> {new_session_id[:8]}...")
 
     return reply
 
@@ -194,7 +401,7 @@ def _process_chat_queue(chat_id: str, message_id: str, chat_type: str, queue: Qu
             text, reaction_id = queue.get_nowait()
 
         try:
-            reply = chat_with_claude(chat_id, text)
+            reply = chat_with_agent(chat_id, text)
             if chat_type == "group":
                 reply_message(message_id, reply)
             else:
