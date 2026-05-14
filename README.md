@@ -30,16 +30,6 @@
 - Claude Code / Codex 后端按聊天独立切换
 - Codex 可按聊天设置工作目录和 sandbox
 
-## 与 ClawdBot 的比较
-
-| 特性 | 本项目 | ClawdBot |
-|------|--------|----------|
-| 聊天平台 | 飞书 | Slack/Discord |
-| AI 后端 | Claude Code / Codex (本地 CLI) | Claude API |
-| 核心能力 | **远程开发 + 本地电脑操作** | 对话助手 |
-| 连接方式 | 飞书长连接 WebSocket | Webhook |
-| 多用户支持 | **每个聊天独立上下文** | 全局/按用户 |
-| 会话管理 | SQLite 持久化 | 内存/Redis |
 
 **相似之处：**
 - 都是将 Agent 接入企业聊天工具
@@ -47,6 +37,7 @@
 - 都通过 session/thread 管理对话上下文
 
 **本项目特色：**
+- 通过 session/thread 管理对话上下文
 - 支持 Claude Code 和 Codex，两套 session 分开保存
 - **每个聊天窗口独立上下文**，群聊成员共享同一上下文
 - 可用 `/backend`、`/model`、`/cwd`、`/sandbox` 在飞书里切换运行方式
